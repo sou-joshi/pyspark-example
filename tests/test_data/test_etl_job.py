@@ -73,7 +73,3 @@ class SparkETLTests(unittest.TestCase):
         self.assertEqual(expected_avg_steps, avg_steps)
         self.assertTrue([col in expected_data.columns
                          for col in data_transformed.columns])
-
-
-if __name__ == '__main__':
-    unittest.main()
