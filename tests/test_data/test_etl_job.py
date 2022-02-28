@@ -8,8 +8,6 @@ that is bundled with the PySpark package.
 """
 import unittest
 
-import json
-
 from pyspark.sql.functions import mean
 
 from dependencies.spark import start_spark
@@ -30,7 +28,7 @@ class SparkETLTests(unittest.TestCase):
     def tearDown(self):
         """Stop Spark
         """
-        self.spark.stop()
+        #self.spark.stop()
 
     def test_transform_data(self):
         """Test data transformer.
