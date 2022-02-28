@@ -58,7 +58,7 @@ def main():
     load_data(data_transformed)
 
     # log the success and terminate Spark application
-    log.warn('test_etl_job is finished')
+    log.warn('test_etl_job is now finished')
     spark.stop()
     return None
 
