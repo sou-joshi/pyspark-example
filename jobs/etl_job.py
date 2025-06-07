@@ -1,121 +1,190 @@
-from pyspark.sql import Row
-from pyspark.sql.functions import col, concat_ws, lit
+import sys
+import json
+import boto3
+import logging
+import traceback
+from datetime import datetime
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, lit, year, month, dayofmonth
+from pyspark.sql.types import StructType, StructField, StringType
 
-from dependencies.spark import start_spark
+# Parameters
+args = getResolvedOptions(
+    sys.argv,
+    [
+        'SOURCE_BUCKET',
+        'SOURCE_KEY',
+        'EXECUTION_ID',
+        'VALIDATION_RULES_PATH',
+        'ERROR_PATH',
+        'BAD_RECORDS_PATH',
+        'TRANSFORMED_PATH',
+        'ICEBERG_DB',
+        'ICEBERG_TABLE',
+        'CHECKPOINT_PATH',
+        'RERUN_MODE', # 'Y' or 'N'
+        'AUDIT_PATH'
+    ]
+)
+SOURCE_BUCKET = args['SOURCE_BUCKET']
+SOURCE_KEY = args['SOURCE_KEY']
+EXECUTION_ID = args['EXECUTION_ID']
+VALIDATION_RULES_PATH = args['VALIDATION_RULES_PATH']
+ERROR_PATH = args['ERROR_PATH']
+BAD_RECORDS_PATH = args['BAD_RECORDS_PATH']
+TRANSFORMED_PATH = args['TRANSFORMED_PATH']
+ICEBERG_DB = args['ICEBERG_DB']
+ICEBERG_TABLE = args['ICEBERG_TABLE']
+CHECKPOINT_PATH = args['CHECKPOINT_PATH']
+RERUN_MODE = args['RERUN_MODE']
+AUDIT_PATH = args['AUDIT_PATH']
 
+# Set up Spark and Glue Context
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
 
-def main():
-    """Main ETL script definition.
+s3 = boto3.client('s3')
+logger = logging.getLogger('GlueJob')
+logger.setLevel(logging.INFO)
 
-    :return: None
-    """
-    # start Spark application and get Spark session, logger and config
-    spark, log, config = start_spark(
-        app_name='my_etl_job',
-        files=['configs/etl_config.json'])
+def write_audit(step, status, details=""):
+    audit_record = {
+        "execution_id": EXECUTION_ID,
+        "timestamp": datetime.now().isoformat(),
+        "source_file": SOURCE_KEY,
+        "step": step,
+        "status": status,
+        "details": details
+    }
+    path = f"{AUDIT_PATH}/audit_{EXECUTION_ID}.json"
+    s3.put_object(
+        Bucket=SOURCE_BUCKET,
+        Key=path,
+        Body=json.dumps(audit_record) + "\n"
+    )
 
-    # log that main ETL job is starting
-    log.warn('etl_job is up-and-running')
+def write_checkpoint(step):
+    s3.put_object(
+        Bucket=SOURCE_BUCKET,
+        Key=f"{CHECKPOINT_PATH}/{EXECUTION_ID}_{step}.checkpoint",
+        Body=b'COMPLETED'
+    )
 
-    # execute ETL pipeline
-    data = extract_data(spark)
-    data_transformed = transform_data(data, config['steps_per_floor'])
-    load_data(data_transformed)
+def checkpoint_exists(step):
+    try:
+        s3.head_object(Bucket=SOURCE_BUCKET, Key=f"{CHECKPOINT_PATH}/{EXECUTION_ID}_{step}.checkpoint")
+        return True
+    except Exception:
+        return False
 
-    # log the success and terminate Spark application
-    log.warn('test_etl_job is now finished')
-    spark.stop()
-    return None
+def read_validation_rules(path):
+    bucket, key = path.replace("s3://", "").split("/", 1)
+    rules_obj = s3.get_object(Bucket=bucket, Key=key)
+    return json.loads(rules_obj['Body'].read().decode('utf-8'))
 
+def validate_data(df, rules):
+    errors = []
+    for rule in rules['rules']:
+        colname = rule['column']
+        condition = rule['condition']
+        value = rule['value']
+        if condition == "not_null":
+            errs = df.filter(col(colname).isNull()).withColumn("error", lit(f"{colname} is null"))
+            errors.append(errs)
+        elif condition == "min":
+            errs = df.filter(col(colname) < value).withColumn("error", lit(f"{colname} < {value}"))
+            errors.append(errs)
+        # Add more rule types as required
+    if errors:
+        bad_records = errors[0]
+        for e in errors[1:]:
+            bad_records = bad_records.union(e)
+        good_records = df.join(bad_records.select("id"), "id", "left_anti")
+    else:
+        bad_records = spark.createDataFrame([], df.schema)
+        good_records = df
+    return good_records, bad_records
 
-def extract_data(spark):
-    """Load data from Parquet file format.
+def move_file_to_error():
+    copy_source = {'Bucket': SOURCE_BUCKET, 'Key': SOURCE_KEY}
+    dest_key = f"{ERROR_PATH}/{SOURCE_KEY.split('/')[-1]}"
+    s3.copy_object(CopySource=copy_source, Bucket=SOURCE_BUCKET, Key=dest_key)
+    s3.delete_object(Bucket=SOURCE_BUCKET, Key=SOURCE_KEY)
 
-    :param spark: Spark session object.
-    :return: Spark DataFrame.
-    """
-    df = (
-        spark
-        .read
-        .parquet('tests/test_data/employees'))
-
+def transformation(df):
+    # Example: add column, rename, join, aggregate, filter
+    df = df.withColumn("ingest_time", lit(datetime.now()))
+    if "cust_id" in df.columns:
+        df = df.withColumnRenamed("cust_id", "customer_id")
+    # Dummy join example (requires a second DataFrame, skipped for brevity)
+    # Aggregate: count by city
+    agg_df = df.groupBy("city").count()
+    # Filter example
+    df = df.filter(col("status") == "active")
+    # Partition columns
+    df = df.withColumn("year", year(col("ingest_time"))) \
+           .withColumn("month", month(col("ingest_time"))) \
+           .withColumn("day", dayofmonth(col("ingest_time")))
     return df
 
+def write_iceberg_table(df):
+    output_path = f"s3://{SOURCE_BUCKET}/{TRANSFORMED_PATH}/"
+    df.write.format("iceberg") \
+        .mode("append") \
+        .option("path", output_path) \
+        .partitionBy("year", "month", "day") \
+        .save(f"{ICEBERG_DB}.{ICEBERG_TABLE}")
 
-def transform_data(df, steps_per_floor_):
-    """Transform original dataset.
+# MAIN FLOW
+try:
+    # Checkpoint: Validation
+    if RERUN_MODE == 'N' or not checkpoint_exists("validation"):
+        write_audit("validation", "STARTED")
+        # Read validation rules
+        rules = read_validation_rules(VALIDATION_RULES_PATH)
+        # Read CSV
+        df = spark.read.option("header", True).csv(f"s3://{SOURCE_BUCKET}/{SOURCE_KEY}")
+        # Validation
+        good_df, bad_df = validate_data(df, rules)
+        if bad_df.count() > 0:
+            bad_path = f"s3://{SOURCE_BUCKET}/{BAD_RECORDS_PATH}/{EXECUTION_ID}_bad_records.csv"
+            bad_df.write.mode("overwrite").csv(bad_path)
+            move_file_to_error()
+            write_audit("validation", "FAILED", "Validation failed. Bad records found.")
+            sys.exit(1)
+        write_checkpoint("validation")
+        write_audit("validation", "SUCCESS")
+    else:
+        # Continue from Transformation
+        df = spark.read.option("header", True).csv(f"s3://{SOURCE_BUCKET}/{SOURCE_KEY}")
 
-    :param df: Input DataFrame.
-    :param steps_per_floor_: The number of steps per-floor at 43 Tanner
-        Street.
-    :return: Transformed DataFrame.
-    """
-    df_transformed = (
-        df
-        .select(
-            col('id'),
-            concat_ws(
-                ' ',
-                col('first_name'),
-                col('second_name')).alias('name'),
-               (col('floor') * lit(steps_per_floor_)).alias('steps_to_desk')))
+    # Checkpoint: Transformation
+    if RERUN_MODE == 'N' or not checkpoint_exists("transformation"):
+        write_audit("transformation", "STARTED")
+        transformed_df = transformation(df)
+        # Save intermediate for potential reruns
+        tmp_path = f"s3://{SOURCE_BUCKET}/{TRANSFORMED_PATH}/tmp/{EXECUTION_ID}/"
+        transformed_df.write.mode("overwrite").parquet(tmp_path)
+        write_checkpoint("transformation")
+        write_audit("transformation", "SUCCESS")
+    else:
+        # Load from checkpoint
+        tmp_path = f"s3://{SOURCE_BUCKET}/{TRANSFORMED_PATH}/tmp/{EXECUTION_ID}/"
+        transformed_df = spark.read.parquet(tmp_path)
 
-    return df_transformed
+    # Checkpoint: Load
+    if RERUN_MODE == 'N' or not checkpoint_exists("load"):
+        write_audit("load", "STARTED")
+        write_iceberg_table(transformed_df)
+        write_checkpoint("load")
+        write_audit("load", "SUCCESS")
 
+except Exception as e:
+    logger.error(traceback.format_exc())
+    write_audit("job", "FAILED", str(e))
+    sys.exit(1)
 
-def load_data(df):
-    """Collect data locally and write to CSV.
-
-    :param df: DataFrame to print.
-    :return: None
-    """
-    (df
-     .coalesce(1)
-     .write
-     .csv('loaded_data', mode='overwrite', header=True))
-    return None
-
-
-def create_test_data(spark, config):
-    """Create test data.
-
-    This function creates both both pre- and post- transformation data
-    saved as Parquet files in tests/test_data. This will be used for
-    unit tests as well as to load as part of the example ETL job.
-    :return: None
-    """
-    # create example data from scratch
-    local_records = [
-        Row(id=1, first_name='Dan', second_name='Germain', floor=1),
-        Row(id=2, first_name='Dan', second_name='Sommerville', floor=1),
-        Row(id=3, first_name='Alex', second_name='Ioannides', floor=2),
-        Row(id=4, first_name='Ken', second_name='Lai', floor=2),
-        Row(id=5, first_name='Stu', second_name='White', floor=3),
-        Row(id=6, first_name='Mark', second_name='Sweeting', floor=3),
-        Row(id=7, first_name='Phil', second_name='Bird', floor=4),
-        Row(id=8, first_name='Kim', second_name='Suter', floor=4)
-    ]
-
-    df = spark.createDataFrame(local_records)
-
-    # write to Parquet file format
-    (df
-     .coalesce(1)
-     .write
-     .parquet('tests/test_data/employees', mode='overwrite'))
-
-    # create transformed version of data
-    df_tf = transform_data(df, config['steps_per_floor'])
-
-    # write transformed version of data to Parquet
-    (df_tf
-     .coalesce(1)
-     .write
-     .parquet('tests/test_data/employees_report', mode='overwrite'))
-
-    return None
-
-
-# entry point for PySpark ETL application
-if __name__ == '__main__':
-    main()
+write_audit("job", "COMPLETED")
